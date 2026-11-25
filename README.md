@@ -10,6 +10,7 @@ Una misma cuenta puede manejar varias empresas (pensado para el estudio contable
 - **Base de datos:** PostgreSQL. Las tablas se crean solas al arrancar. Sin `DATABASE_URL`, en desarrollo los datos quedan en memoria.
 - **Interfaz:** una sola página sin compilación (`public/index.html`).
 - **ARCA:** autenticación WSAA (firma CMS del ticket de acceso con el certificado de la empresa) y factura electrónica WSFEv1 (`FECompUltimoAutorizado` + `FECAESolicitar`). Comprobantes C (Factura, Nota de crédito y Nota de débito) para monotributistas, con la condición frente al IVA del receptor que exige la RG 5616.
+- **Ingreso sin contraseña:** la persona escribe su email y recibe un código de 6 dígitos (vence en 10 minutos, 5 intentos, se guarda solo su hash). La primera vez la cuenta se crea sola. Los emails salen por la API de [Brevo](https://www.brevo.com) (plan gratis: 300 por día). En desarrollo, sin Brevo, el código aparece en la consola del servidor.
 - **Certificados:** se guardan cifrados con AES-256-GCM usando `MASTER_KEY`. Nunca se suben al repositorio.
 - **Lectura de comprobantes:** API de Claude (modelo `claude-opus-5-5`, con fallback del servidor si el modelo declina). Lee fotos y PDF; el usuario revisa los datos antes de guardar.
 
@@ -18,7 +19,7 @@ Una misma cuenta puede manejar varias empresas (pensado para el estudio contable
 ```bash
 npm install
 cp .env.example .env   # completar lo que haga falta
-npm run dev            # http://localhost:3000
+npm run dev            # http://localhost:3000 (el código de ingreso se ve en la consola)
 npm test               # pruebas (incluye firma CMS verificada con OpenSSL)
 ```
 
@@ -29,6 +30,7 @@ npm test               # pruebas (incluye firma CMS verificada con OpenSSL)
 3. Completá las variables de entorno en Render:
    - `DATABASE_URL`: la cadena de Neon.
    - `MASTER_KEY`: 32 bytes en base64, generados con `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. **Guardala en un lugar seguro**: si se pierde, hay que volver a cargar los certificados de ARCA.
+   - `BREVO_API_KEY` y `MAIL_FROM`: para enviar los códigos de ingreso. Creá una cuenta gratis en Brevo, verificá el email remitente (Senders) y generá una clave API (SMTP & API → API Keys). `MAIL_FROM` es ese email verificado. Para que no caigan en spam conviene, más adelante, autenticar un dominio propio en Brevo.
    - `ANTHROPIC_API_KEY`: opcional, activa la lectura de comprobantes con IA.
    - `SESSION_SECRET` lo genera Render solo.
 4. Cada cambio que se aprueba en `main` se publica automáticamente.

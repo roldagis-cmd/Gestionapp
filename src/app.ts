@@ -1,7 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import cookieParser from "cookie-parser";
 import multer from "multer";
-import bcrypt from "bcryptjs";
+import { createHmac, randomInt, timingSafeEqual } from "node:crypto";
 import jwt from "jsonwebtoken";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,18 +13,20 @@ import { ServicioArca } from "./arca/servicio.js";
 import { ArcaError, type FetchLike } from "./arca/soap.js";
 import { leerComprobante, OcrError } from "./ocr.js";
 import type { Config } from "./config.js";
+import { correoBrevo, correoConsola, mensajeCodigo, mensajeInvitacion, type Correo } from "./correo.js";
 
 const aqui = path.dirname(fileURLToPath(import.meta.url));
 const COOKIE = "gapp_sesion";
 
 interface ReqAuth extends Request { usuarioId?: string; empresaId?: string; rol?: Rol }
 
-export interface Deps { store: Store; config: Config; fetchFn?: FetchLike; anthropic?: Anthropic | null }
+export interface Deps { store: Store; config: Config; fetchFn?: FetchLike; anthropic?: Anthropic | null; correo?: Correo }
 
-export function crearApp({ store, config, fetchFn, anthropic }: Deps) {
+export function crearApp({ store, config, fetchFn, anthropic, correo }: Deps) {
   const app = express();
   const arca = new ServicioArca(store, config.masterKey, fetchFn);
   const claude = anthropic !== undefined ? anthropic : config.anthropicApiKey ? new Anthropic({ apiKey: config.anthropicApiKey }) : null;
+  const mail: Correo = correo ?? (config.brevoApiKey && config.mailFrom ? correoBrevo(config.brevoApiKey, config.mailFrom, fetchFn) : correoConsola);
   const subida = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 2 } });
 
   app.disable("x-powered-by");
@@ -63,24 +65,61 @@ export function crearApp({ store, config, fetchFn, anthropic }: Deps) {
   const h = (fn: (req: ReqAuth, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => fn(req as ReqAuth, res).catch(next);
 
   // ---------- sesión ----------
-  const Registro = z.object({ email: z.string().email(), password: z.string().min(8, "La contraseña necesita al menos 8 caracteres."), nombre: z.string().trim().min(1).max(120), empresa: z.string().trim().min(1).max(160) });
-  app.post("/api/auth/registro", h(async (req, res) => {
-    const p = Registro.safeParse(req.body);
-    if (!p.success) return res.status(400).json({ error: p.error.issues[0]?.message ?? "Datos inválidos." });
-    try {
-      const u = await store.crearUsuario(p.data.email, p.data.nombre, await bcrypt.hash(p.data.password, 11));
-      await store.crearEmpresa(p.data.empresa, u.id);
-      firmar(res, u.id); res.status(201).json({ ok: true });
-    } catch (e) {
-      if (e instanceof Error && e.message === "EMAIL_EXISTE") return res.status(409).json({ error: "Ya hay una cuenta con ese email." });
-      throw e;
+  // Ingreso sin contraseña: la persona escribe su email y recibe un código de 6 dígitos.
+  const VIGENCIA_MS = 10 * 60 * 1000, ESPERA_MS = 60 * 1000, MAX_INTENTOS = 5;
+  const Email = z.string().trim().toLowerCase().email().max(200);
+  const hashCodigo = (email: string, codigo: string) => createHmac("sha256", config.sessionSecret).update(`${email}:${codigo}`).digest("hex");
+  // Límite por dirección IP, en memoria (alcanza para una sola instancia).
+  const pedidos = new Map<string, number[]>();
+  const limite = (clave: string, max: number, ventanaMs: number) => {
+    const ahora = Date.now(), lista = (pedidos.get(clave) ?? []).filter(t => ahora - t < ventanaMs);
+    if (lista.length >= max) { pedidos.set(clave, lista); return false; }
+    lista.push(ahora); pedidos.set(clave, lista);
+    if (pedidos.size > 10000) for (const [k, v] of pedidos) if (!v.some(t => ahora - t < ventanaMs)) pedidos.delete(k);
+    return true;
+  };
+  const urlDe = (req: Request) => `${req.protocol}://${req.get("host")}/`;
+
+  app.post("/api/auth/codigo", h(async (req, res) => {
+    const p = Email.safeParse(req.body?.email);
+    if (!p.success) return res.status(400).json({ error: "Escribí un email válido." });
+    const email = p.data;
+    if (!limite(`codigo|${req.ip}`, 10, 15 * 60 * 1000)) return res.status(429).json({ error: "Pediste demasiados códigos. Esperá unos minutos y probá de nuevo." });
+    const previo = await store.codigo(email);
+    if (previo && Date.now() - Date.parse(previo.enviado) < ESPERA_MS) return res.status(429).json({ error: "Ya te mandamos un código. Esperá un minuto para pedir otro." });
+    const codigo = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    const ahora = Date.now();
+    await store.guardarCodigo(email, { hash: hashCodigo(email, codigo), vence: new Date(ahora + VIGENCIA_MS).toISOString(), intentos: 0, enviado: new Date(ahora).toISOString() });
+    const m = mensajeCodigo(codigo);
+    try { await mail.enviar(email, m.asunto, m.texto, m.html); }
+    catch (e) {
+      await store.borrarCodigo(email);
+      console.error("No se pudo enviar el código:", e);
+      return res.status(502).json({ error: "No pudimos enviar el email. Revisá la dirección o probá en unos minutos." });
     }
+    res.json({ ok: true });
   }));
-  app.post("/api/auth/login", h(async (req, res) => {
-    const email = String(req.body?.email ?? ""), password = String(req.body?.password ?? "");
-    const u = await store.usuarioPorEmail(email);
-    if (!u || !(await bcrypt.compare(password, u.passwordHash))) return res.status(401).json({ error: "Email o contraseña incorrectos." });
-    firmar(res, u.id); res.json({ ok: true });
+  app.post("/api/auth/verificar", h(async (req, res) => {
+    const p = Email.safeParse(req.body?.email);
+    const codigo = String(req.body?.codigo ?? "").replace(/\D/g, "");
+    if (!p.success || codigo.length !== 6) return res.status(400).json({ error: "Escribí los 6 números del código." });
+    if (!limite(`verificar|${req.ip}`, 30, 15 * 60 * 1000)) return res.status(429).json({ error: "Demasiados intentos. Esperá unos minutos." });
+    const email = p.data, c = await store.codigo(email);
+    if (!c || Date.parse(c.vence) < Date.now()) return res.status(400).json({ error: "El código venció. Pedí uno nuevo." });
+    if (c.intentos >= MAX_INTENTOS) { await store.borrarCodigo(email); return res.status(400).json({ error: "Demasiados intentos con ese código. Pedí uno nuevo." }); }
+    const ok = timingSafeEqual(Buffer.from(hashCodigo(email, codigo)), Buffer.from(c.hash));
+    if (!ok) {
+      await store.sumarIntento(email);
+      const quedan = MAX_INTENTOS - c.intentos - 1;
+      return res.status(400).json({ error: quedan > 0 ? `El código no es correcto. Te ${quedan === 1 ? "queda 1 intento" : `quedan ${quedan} intentos`}.` : "El código no es correcto. Pedí uno nuevo." });
+    }
+    await store.borrarCodigo(email);
+    let u = await store.usuarioPorEmail(email);
+    if (!u) {
+      try { u = await store.crearUsuario(email, ""); }
+      catch (e) { if (e instanceof Error && e.message === "EMAIL_EXISTE") u = await store.usuarioPorEmail(email); else throw e; }
+    }
+    firmar(res, u!.id); res.json({ ok: true, nuevo: !u!.nombre });
   }));
   app.post("/api/auth/logout", (_req, res) => { res.clearCookie(COOKIE, { path: "/" }); res.json({ ok: true }); });
   app.get("/api/me", autenticado, h(async (req, res) => {
@@ -88,6 +127,11 @@ export function crearApp({ store, config, fetchFn, anthropic }: Deps) {
     if (!u) return res.status(401).json({ error: "Tenés que iniciar sesión." });
     const ms = await store.membresias(u.id);
     res.json({ usuario: { id: u.id, email: u.email, nombre: u.nombre }, empresas: ms.map(m => ({ ...m.empresa, rol: m.rol })), ocr: !!claude });
+  }));
+  app.put("/api/me", autenticado, h(async (req, res) => {
+    const nombre = String(req.body?.nombre ?? "").trim();
+    if (!nombre) return res.status(400).json({ error: "Escribí tu nombre." });
+    await store.cambiarNombre(req.usuarioId!, nombre.slice(0, 120)); res.json({ ok: true });
   }));
 
   // ---------- empresas ----------
@@ -99,9 +143,20 @@ export function crearApp({ store, config, fetchFn, anthropic }: Deps) {
   app.post("/api/empresas/:eid/miembros", autenticado, enEmpresa(["dueño", "contador"]), h(async (req, res) => {
     const rol = String(req.body?.rol) as Rol;
     if (!["contador", "usuario"].includes(rol)) return res.status(400).json({ error: "El rol tiene que ser contador o usuario." });
-    const u = await store.usuarioPorEmail(String(req.body?.email ?? ""));
-    if (!u) return res.status(404).json({ error: "Esa persona todavía no tiene cuenta en GESTIONAPP. Pedile que se registre primero." });
-    await store.agregarMiembro(req.empresaId!, u.id, rol); res.json({ ok: true });
+    const p = Email.safeParse(req.body?.email);
+    if (!p.success) return res.status(400).json({ error: "Escribí un email válido." });
+    let u = await store.usuarioPorEmail(p.data);
+    if (!u) {
+      try { u = await store.crearUsuario(p.data, ""); }
+      catch (e) { if (e instanceof Error && e.message === "EMAIL_EXISTE") u = await store.usuarioPorEmail(p.data); else throw e; }
+    }
+    await store.agregarMiembro(req.empresaId!, u!.id, rol);
+    // Aviso por email: si falla, el acceso igual queda dado.
+    const empresa = (await store.membresias(req.usuarioId!)).find(m => m.empresa.id === req.empresaId)?.empresa.nombre ?? "una empresa";
+    const m = mensajeInvitacion(empresa, urlDe(req));
+    let avisado = true;
+    try { await mail.enviar(p.data, m.asunto, m.texto, m.html); } catch (e) { avisado = false; console.error("No se pudo enviar la invitación:", e); }
+    res.json({ ok: true, avisado });
   }));
 
   // ---------- datos ----------

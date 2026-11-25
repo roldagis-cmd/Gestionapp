@@ -3,6 +3,8 @@ export interface Config {
   sessionSecret: string;
   masterKey: Buffer;
   anthropicApiKey?: string;
+  brevoApiKey?: string;
+  mailFrom?: string;
   port: number;
   produccion: boolean;
 }
@@ -13,11 +15,15 @@ export function leerConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!sessionSecret) throw new Error("Falta SESSION_SECRET");
   const mk = env.MASTER_KEY ? Buffer.from(env.MASTER_KEY, "base64") : produccion ? Buffer.alloc(0) : Buffer.alloc(32, 7);
   if (mk.length !== 32) throw new Error("MASTER_KEY tiene que ser 32 bytes en base64");
+  const brevoApiKey = env.BREVO_API_KEY || undefined, mailFrom = env.MAIL_FROM || undefined;
+  if (produccion && (!brevoApiKey || !mailFrom)) throw new Error("Faltan BREVO_API_KEY y MAIL_FROM: sin ellos no se pueden enviar los códigos de ingreso");
   return {
     databaseUrl: env.DATABASE_URL,
     sessionSecret,
     masterKey: mk,
     anthropicApiKey: env.ANTHROPIC_API_KEY || undefined,
+    brevoApiKey,
+    mailFrom,
     port: Number(env.PORT) || 3000,
     produccion,
   };

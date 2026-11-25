@@ -398,38 +398,73 @@ function nuevaEmpresa(){
       h("div",{class:"actions"}, h("button",{class:"btn primary",type:"submit"},"Crear empresa"), h("button",{class:"btn",type:"button",onclick:close},"Cancelar")));
     return f; });
 }
+function pantallaAuth(titulo, sub, cuerpo){
+  const root=$("#auth"); root.hidden=false;
+  root.replaceChildren(h("div",{class:"modal",role:"main"},
+    h("img",{class:"logo-claro",src:"/logo/gapp-logo.svg",alt:"Gapp, Gestión App"}), h("img",{class:"logo-oscuro",src:"/logo/gapp-logo-oscuro.svg",alt:"Gapp, Gestión App"}),
+    h("h1",{style:"text-align:center;font-size:1.3rem;margin-bottom:0"}, titulo),
+    sub ? h("p",{style:"text-align:center;color:var(--muted);margin:4px 0 0"}, sub) : null, cuerpo));
+  setTimeout(()=>{ const i=root.querySelector("input"); if(i) i.focus(); },20);
+}
 function showAuth(){
   $("#app").hidden=true; $("#modalRoot").replaceChildren();
-  let modo="login";
-  const root=$("#auth"); root.hidden=false;
-  const draw=()=>{
+  let email=""; try{ email=localStorage.getItem("gapp-email")||""; }catch(_){}
+  const pasoEmail=()=>{
     const err=h("p",{class:"err",role:"alert"});
-    const f=h("form",{class:"f",onsubmit:async e=>{ e.preventDefault(); const fd=new FormData(f); err.textContent="";
-      const b=f.querySelector("button[type=submit]"); b.disabled=true;
-      try{
-        if (modo==="login") await api("POST","/api/auth/login",{email:fd.get("email"),password:fd.get("password")});
-        else await api("POST","/api/auth/registro",{email:fd.get("email"),password:fd.get("password"),nombre:fd.get("nombre"),empresa:fd.get("empresa")});
-        root.hidden=true; boot();
-      }catch(x){ err.textContent=x.message; b.disabled=false; } }},
-      modo==="registro" ? field("Tu nombre", h("input",{id:"au-nombre",name:"nombre",autocomplete:"name",required:true})) : null,
-      modo==="registro" ? field("Nombre de tu empresa o negocio", h("input",{id:"au-emp",name:"empresa",required:true})) : null,
-      field("Email", h("input",{id:"au-email",name:"email",type:"email",autocomplete:"email",required:true})),
-      field("Contraseña", h("input",{id:"au-pass",name:"password",type:"password",autocomplete:modo==="login"?"current-password":"new-password",minlength:modo==="registro"?"8":null,required:true})),
-      err,
-      h("button",{class:"btn primary",type:"submit"}, modo==="login"?"Entrar":"Crear cuenta"),
-      h("button",{class:"btn ghost",type:"button",onclick:()=>{ modo=modo==="login"?"registro":"login"; draw(); }}, modo==="login"?"¿No tenés cuenta? Creala acá":"Ya tengo cuenta"));
-    root.replaceChildren(h("div",{class:"modal",role:"main"},
-      h("img",{class:"logo-claro",src:"/logo/gapp-logo.svg",alt:"Gapp, Gestión App"}), h("img",{class:"logo-oscuro",src:"/logo/gapp-logo-oscuro.svg",alt:"Gapp, Gestión App"}),
-      h("h1",{style:"text-align:center;font-size:1.3rem"}, modo==="login"?"Entrá a tu cuenta":"Creá tu cuenta"), f));
-    setTimeout(()=>{ const i=root.querySelector("input"); if(i) i.focus(); },20);
+    const f=h("form",{class:"f",onsubmit:async e=>{ e.preventDefault(); err.textContent="";
+      const b=f.querySelector("button[type=submit]"); b.disabled=true; b.textContent="Enviando…";
+      email=$("#au-email",f).value.trim().toLowerCase();
+      try{ await api("POST","/api/auth/codigo",{email}); try{ localStorage.setItem("gapp-email",email); }catch(_){} pasoCodigo(); }
+      catch(x){ err.textContent=x.message; b.disabled=false; b.textContent="Enviarme el código"; } }},
+      field("Tu email", h("input",{id:"au-email",name:"email",type:"email",autocomplete:"email",required:true,value:email})),
+      err, h("button",{class:"btn primary",type:"submit"},"Enviarme el código"),
+      h("p",{style:"margin:0;font-size:.85rem;color:var(--muted);text-align:center"},"No necesitás contraseña: cada vez que entres te mandamos un código de 6 números. Si es tu primera vez, la cuenta se crea sola."));
+    pantallaAuth("Entrá a GESTIONAPP", null, f);
   };
-  draw();
+  const pasoCodigo=()=>{
+    const err=h("p",{class:"err",role:"alert"}), info=h("p",{role:"status",style:"margin:0;font-size:.85rem;color:var(--muted);text-align:center"});
+    const input=h("input",{id:"au-codigo",name:"codigo",inputmode:"numeric",autocomplete:"one-time-code",pattern:"[0-9]{6}",maxlength:"6",required:true,placeholder:"000000",
+      style:"font-size:1.6rem;letter-spacing:.4em;text-align:center;font-variant-numeric:tabular-nums",
+      oninput:()=>{ input.value=input.value.replace(/\D/g,"").slice(0,6); if(input.value.length===6) f.requestSubmit(); }});
+    let enviando=false;
+    const f=h("form",{class:"f",onsubmit:async e=>{ e.preventDefault(); if(enviando) return; err.textContent="";
+      const b=f.querySelector("button[type=submit]"); enviando=true; b.disabled=true;
+      try{ await api("POST","/api/auth/verificar",{email, codigo:input.value}); $("#auth").hidden=true; boot(); }
+      catch(x){ err.textContent=x.message; input.value=""; input.focus(); b.disabled=false; enviando=false; } }},
+      field("Código de 6 números", input), err,
+      h("button",{class:"btn primary",type:"submit"},"Entrar"),
+      h("div",{class:"actions",style:"justify-content:center"},
+        h("button",{class:"btn ghost small",type:"button",onclick:async ev=>{ const b=ev.currentTarget; b.disabled=true; err.textContent="";
+          try{ await api("POST","/api/auth/codigo",{email}); info.textContent="Te mandamos un código nuevo."; }catch(x){ err.textContent=x.message; }
+          setTimeout(()=>{ b.disabled=false; },60000); }},"Reenviar código"),
+        h("button",{class:"btn ghost small",type:"button",onclick:pasoEmail},"Usar otro email")), info,
+      h("p",{style:"margin:0;font-size:.85rem;color:var(--muted);text-align:center"},"Vence en 10 minutos. Si no lo ves, revisá la carpeta de spam."));
+    pantallaAuth("Revisá tu email", "Te mandamos un código a "+email, f);
+  };
+  pasoEmail();
+}
+function bienvenida(){
+  $("#app").hidden=true;
+  const falta={ nombre:!API.me.usuario.nombre, empresa:!API.me.empresas.length };
+  const err=h("p",{class:"err",role:"alert"});
+  const f=h("form",{class:"f",onsubmit:async e=>{ e.preventDefault(); err.textContent=""; const b=f.querySelector("button[type=submit]"); b.disabled=true;
+    try{
+      if (falta.nombre) await api("PUT","/api/me",{nombre:$("#bv-nombre",f).value.trim()});
+      if (falta.empresa){ const emp=await api("POST","/api/empresas",{nombre:$("#bv-emp",f).value.trim()}); try{ localStorage.setItem("gapp-empresa",emp.id); }catch(_){} }
+      boot();
+    }catch(x){ err.textContent=x.message; b.disabled=false; } }},
+    falta.nombre ? field("Tu nombre", h("input",{id:"bv-nombre",autocomplete:"name",required:true})) : null,
+    falta.empresa ? field("Nombre de tu empresa o negocio", h("input",{id:"bv-emp",required:true})) : null,
+    err, h("button",{class:"btn primary",type:"submit"},"Empezar"),
+    h("button",{class:"btn ghost",type:"button",onclick:salir},"Salir"));
+  pantallaAuth("¡Te damos la bienvenida!", falta.empresa ? "Contanos quién sos y cómo se llama tu negocio." : "Contanos tu nombre.", f);
 }
 async function salir(){ try{ await api("POST","/api/auth/logout",{}); }catch(_){} API.me=null; API.emp=null; showAuth(); }
 async function boot(){
   try { API.me=await api("GET","/api/me"); }
   catch(e){ if (e.status===401) return showAuth(); $("#auth").hidden=false; $("#auth").replaceChildren(h("div",{class:"modal"},h("h2",{},"No se pudo conectar"),h("p",{},e.message),h("button",{class:"btn primary",onclick:()=>location.reload()},"Reintentar"))); return; }
   API.ocr=!!API.me.ocr;
+  if (!API.me.usuario.nombre || !API.me.empresas.length) return bienvenida();
   $("#auth").hidden=true; $("#auth").replaceChildren(); $("#app").hidden=false;
   let guardada=null; try{ guardada=localStorage.getItem("gapp-empresa"); }catch(_){}
   const emp = API.me.empresas.find(e=>e.id===guardada) || API.me.empresas[0];
@@ -1131,13 +1166,13 @@ function equipoCard(){
   if (API.rol==="usuario") return null;
   const msg=h("p",{role:"status",style:"margin:0;font-size:.9rem;color:var(--muted)"});
   const f=h("form",{class:"f",onsubmit:async e=>{ e.preventDefault(); const fd=new FormData(f);
-    try{ await api("POST", base()+"/miembros",{email:fd.get("email"),rol:fd.get("rol")}); msg.textContent="Listo: ya puede entrar a esta empresa con su cuenta."; f.reset(); }
+    try{ const r=await api("POST", base()+"/miembros",{email:fd.get("email"),rol:fd.get("rol")}); msg.textContent=r.avisado?"Listo: le mandamos un email. Entra con su dirección y un código.":"Listo: ya tiene acceso. No pudimos mandarle el aviso, avisale que entre con su email."; f.reset(); }
     catch(x){ msg.textContent=x.message; } }},
     h("div",{class:"two"},
       field("Email de la persona", h("input",{id:"eq-email",name:"email",type:"email",required:true})),
       field("Rol", h("select",{id:"eq-rol",name:"rol"}, h("option",{value:"usuario"},"Usuario (carga ventas, gastos y turnos)"), h("option",{value:"contador"},"Contador (además, ajustes y ARCA)")))),
     h("div",{class:"actions"}, h("button",{class:"btn",type:"submit"},"Dar acceso")), msg);
-  return h("div",{class:"card stack"}, h("h2",{},"Equipo"), h("p",{style:"margin:0;color:var(--muted)"},"La persona tiene que crear su cuenta en GESTIONAPP primero. Después le das acceso con su email."), f);
+  return h("div",{class:"card stack"}, h("h2",{},"Equipo"), h("p",{style:"margin:0;color:var(--muted)"},"Escribí el email de la persona: le llega un aviso y entra con ese email, sin contraseña."), f);
 }
 function field(label, input){ const id=input.id||("f-"+uid()); input.id=id; return h("div",{class:"field"}, h("label",{for:id},label), input); }
 

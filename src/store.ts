@@ -2,7 +2,8 @@ import pg from "pg";
 import { randomUUID } from "node:crypto";
 
 export type Rol = "dueño" | "contador" | "usuario";
-export interface Usuario { id: string; email: string; nombre: string; passwordHash: string }
+export interface Usuario { id: string; email: string; nombre: string }
+export interface CodigoIngreso { hash: string; vence: string; intentos: number; enviado: string }
 export interface Empresa { id: string; nombre: string; cuit: string }
 export interface Membresia { empresa: Empresa; rol: Rol }
 export interface CredencialArca { ambiente: "homologacion" | "produccion"; certEnc: string; keyEnc: string; actualizado: string }
@@ -15,7 +16,12 @@ export type Doc = Record<string, unknown> & { id: string };
 /** Almacenamiento: usuarios, empresas y los datos de cada empresa como documentos JSON por colección. */
 export interface Store {
   init(): Promise<void>;
-  crearUsuario(email: string, nombre: string, passwordHash: string): Promise<Usuario>;
+  crearUsuario(email: string, nombre: string): Promise<Usuario>;
+  cambiarNombre(usuarioId: string, nombre: string): Promise<void>;
+  guardarCodigo(email: string, c: CodigoIngreso): Promise<void>;
+  codigo(email: string): Promise<CodigoIngreso | null>;
+  sumarIntento(email: string): Promise<void>;
+  borrarCodigo(email: string): Promise<void>;
   usuarioPorEmail(email: string): Promise<Usuario | null>;
   usuarioPorId(id: string): Promise<Usuario | null>;
   crearEmpresa(nombre: string, duenioId: string): Promise<Empresa>;
@@ -42,11 +48,17 @@ export class MemoryStore implements Store {
   creds = new Map<string, CredencialArca>();
   tokens = new Map<string, TokenArca>();
   async init() {}
-  async crearUsuario(email: string, nombre: string, passwordHash: string) {
+  codigos = new Map<string, CodigoIngreso>();
+  async crearUsuario(email: string, nombre: string) {
     if (await this.usuarioPorEmail(email)) throw new Error("EMAIL_EXISTE");
-    const u = { id: randomUUID(), email: email.toLowerCase(), nombre, passwordHash };
+    const u = { id: randomUUID(), email: email.toLowerCase(), nombre };
     this.usuarios.set(u.id, u); return u;
   }
+  async cambiarNombre(usuarioId: string, nombre: string) { const u = this.usuarios.get(usuarioId); if (u) u.nombre = nombre; }
+  async guardarCodigo(email: string, c: CodigoIngreso) { this.codigos.set(email.toLowerCase(), { ...c }); }
+  async codigo(email: string) { const c = this.codigos.get(email.toLowerCase()); return c ? { ...c } : null; }
+  async sumarIntento(email: string) { const c = this.codigos.get(email.toLowerCase()); if (c) c.intentos++; }
+  async borrarCodigo(email: string) { this.codigos.delete(email.toLowerCase()); }
   async usuarioPorEmail(email: string) { return [...this.usuarios.values()].find(u => u.email === email.toLowerCase()) ?? null; }
   async usuarioPorId(id: string) { return this.usuarios.get(id) ?? null; }
   async crearEmpresa(nombre: string, duenioId: string) {
@@ -78,7 +90,9 @@ export class MemoryStore implements Store {
 }
 
 const ESQUEMA = `
-create table if not exists usuarios (id text primary key, email text unique not null, nombre text not null default '', password_hash text not null, creado timestamptz not null default now());
+create table if not exists usuarios (id text primary key, email text unique not null, nombre text not null default '', creado timestamptz not null default now());
+alter table usuarios drop column if exists password_hash;
+create table if not exists login_codigos (email text primary key, hash text not null, vence timestamptz not null, intentos int not null default 0, enviado timestamptz not null);
 create table if not exists empresas (id text primary key, nombre text not null, cuit text not null default '', creado timestamptz not null default now());
 create table if not exists membresias (usuario_id text not null references usuarios(id) on delete cascade, empresa_id text not null references empresas(id) on delete cascade, rol text not null, primary key (usuario_id, empresa_id));
 create table if not exists docs (empresa_id text not null references empresas(id) on delete cascade, coleccion text not null, id text not null, data jsonb not null, actualizado timestamptz not null default now(), primary key (empresa_id, coleccion, id));
@@ -92,13 +106,23 @@ export class PgStore implements Store {
     this.pool = new pg.Pool({ connectionString: url, ssl: /localhost|127\.0\.0\.1/.test(url) ? undefined : { rejectUnauthorized: false } });
   }
   async init() { await this.pool.query(ESQUEMA); }
-  private u(r: any): Usuario { return { id: r.id, email: r.email, nombre: r.nombre, passwordHash: r.password_hash }; }
-  async crearUsuario(email: string, nombre: string, passwordHash: string) {
+  private u(r: any): Usuario { return { id: r.id, email: r.email, nombre: r.nombre }; }
+  async crearUsuario(email: string, nombre: string) {
     try {
-      const r = await this.pool.query("insert into usuarios (id,email,nombre,password_hash) values ($1,$2,$3,$4) returning *", [randomUUID(), email.toLowerCase(), nombre, passwordHash]);
+      const r = await this.pool.query("insert into usuarios (id,email,nombre) values ($1,$2,$3) returning *", [randomUUID(), email.toLowerCase(), nombre]);
       return this.u(r.rows[0]);
     } catch (e: any) { if (e.code === "23505") throw new Error("EMAIL_EXISTE"); throw e; }
   }
+  async cambiarNombre(usuarioId: string, nombre: string) { await this.pool.query("update usuarios set nombre=$2 where id=$1", [usuarioId, nombre]); }
+  async guardarCodigo(email: string, c: CodigoIngreso) {
+    await this.pool.query("insert into login_codigos (email,hash,vence,intentos,enviado) values ($1,$2,$3,$4,$5) on conflict (email) do update set hash=excluded.hash, vence=excluded.vence, intentos=excluded.intentos, enviado=excluded.enviado", [email.toLowerCase(), c.hash, c.vence, c.intentos, c.enviado]);
+  }
+  async codigo(email: string) {
+    const r = await this.pool.query("select * from login_codigos where email=$1", [email.toLowerCase()]);
+    const x = r.rows[0]; return x ? { hash: x.hash, vence: new Date(x.vence).toISOString(), intentos: x.intentos, enviado: new Date(x.enviado).toISOString() } : null;
+  }
+  async sumarIntento(email: string) { await this.pool.query("update login_codigos set intentos=intentos+1 where email=$1", [email.toLowerCase()]); }
+  async borrarCodigo(email: string) { await this.pool.query("delete from login_codigos where email=$1", [email.toLowerCase()]); }
   async usuarioPorEmail(email: string) { const r = await this.pool.query("select * from usuarios where email=$1", [email.toLowerCase()]); return r.rows[0] ? this.u(r.rows[0]) : null; }
   async usuarioPorId(id: string) { const r = await this.pool.query("select * from usuarios where id=$1", [id]); return r.rows[0] ? this.u(r.rows[0]) : null; }
   async crearEmpresa(nombre: string, duenioId: string) {
