@@ -1,0 +1,108 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import request from "supertest";
+import { crearApp } from "../src/app.js";
+import { MemoryStore } from "../src/store.js";
+import { leerConfig } from "../src/config.js";
+import { certificadoDePrueba, arcaFalsa } from "./ayuda.js";
+
+const config = leerConfig({ NODE_ENV: "test" });
+const H = { "x-gestionapp": "1" };
+
+async function cuenta(app: any, email: string) {
+  const agent = request.agent(app);
+  await agent.post("/api/auth/registro").set(H).send({ email, password: "clave-segura-1", nombre: "Gisela", empresa: "Almacén Sol" }).expect(201);
+  const me = await agent.get("/api/me").expect(200);
+  return { agent, empresaId: me.body.empresas[0].id as string };
+}
+
+describe("API", () => {
+  let store: MemoryStore, arca: ReturnType<typeof arcaFalsa>, app: any;
+  beforeEach(() => { store = new MemoryStore(); arca = arcaFalsa({ ultimo: 41 }); app = crearApp({ store, config, fetchFn: arca.fn, anthropic: null }); });
+
+  it("pide sesión y rechaza pedidos sin el encabezado anti-CSRF", async () => {
+    await request(app).get("/api/me").expect(401);
+    await request(app).post("/api/auth/login").send({ email: "a@b.com", password: "x" }).expect(403);
+  });
+
+  it("registra, inicia sesión y guarda y lista documentos de la empresa", async () => {
+    const { agent, empresaId } = await cuenta(app, "gisela@example.com");
+    await agent.put(`/api/empresas/${empresaId}/clientes/c1`).set(H).send({ nombre: "Lucía" }).expect(200);
+    await agent.put(`/api/empresas/${empresaId}/config/negocio`).set(H).send({ nombre: "Almacén Sol", cuit: "20-12345678-6" }).expect(200);
+    const d = await agent.get(`/api/empresas/${empresaId}/datos`).expect(200);
+    expect(d.body.clientes).toEqual([{ id: "c1", nombre: "Lucía" }]);
+    expect(d.body.config.cuit).toBe("20-12345678-6");
+    await agent.delete(`/api/empresas/${empresaId}/clientes/c1`).set(H).expect(200);
+    await agent.put(`/api/empresas/${empresaId}/secretos/x`).set(H).send({}).expect(404);
+    const login = request.agent(app);
+    await login.post("/api/auth/login").set(H).send({ email: "gisela@example.com", password: "mal" }).expect(401);
+    await login.post("/api/auth/login").set(H).send({ email: "GISELA@example.com", password: "clave-segura-1" }).expect(200);
+  });
+
+  it("no deja ver ni tocar empresas ajenas", async () => {
+    const a = await cuenta(app, "a@example.com");
+    const b = await cuenta(app, "b@example.com");
+    await b.agent.get(`/api/empresas/${a.empresaId}/datos`).expect(404);
+    await b.agent.put(`/api/empresas/${a.empresaId}/clientes/x`).set(H).send({ nombre: "intruso" }).expect(404);
+  });
+
+  it("la contadora invitada accede a la empresa del cliente", async () => {
+    const pyme = await cuenta(app, "pyme@example.com");
+    const conta = await cuenta(app, "conta@example.com");
+    await pyme.agent.post(`/api/empresas/${pyme.empresaId}/miembros`).set(H).send({ email: "conta@example.com", rol: "contador" }).expect(200);
+    const me = await conta.agent.get("/api/me").expect(200);
+    expect(me.body.empresas.map((e: any) => e.rol).sort()).toEqual(["contador", "dueño"]);
+    await conta.agent.get(`/api/empresas/${pyme.empresaId}/datos`).expect(200);
+  });
+
+  it("autoriza una Factura C en ARCA con el número siguiente y guarda el CAE", async () => {
+    const { agent, empresaId } = await cuenta(app, "fact@example.com");
+    const { certPem, keyPem } = certificadoDePrueba();
+    await agent.put(`/api/empresas/${empresaId}/config/negocio`).set(H).send({ nombre: "Almacén Sol", cuit: "20-12345678-6" }).expect(200);
+    await agent.post(`/api/empresas/${empresaId}/arca/credenciales`).set(H).field("ambiente", "homologacion").attach("cert", Buffer.from(certPem), "a.crt").attach("key", Buffer.from(keyPem), "a.key").expect(200);
+    const estado = await agent.get(`/api/empresas/${empresaId}/arca`).expect(200);
+    expect(estado.body).toMatchObject({ configurado: true, ambiente: "homologacion" });
+    // El certificado queda cifrado
+    expect(store.creds.get(empresaId)!.certEnc).not.toContain("BEGIN CERTIFICATE");
+
+    await agent.put(`/api/empresas/${empresaId}/facturas/f1`).set(H).send({ cbte: 11, puntoVenta: 2, numero: 0, fecha: "2026-11-25", docTipo: "CF", docNro: "", concepto: "Productos", total: 1500, estado: "pendiente" }).expect(200);
+    const r = await agent.post(`/api/empresas/${empresaId}/facturas/f1/autorizar`).set(H).expect(200);
+    expect(r.body).toMatchObject({ estado: "autorizada", numero: 42, cae: "76123456789012", caeVto: "2026-12-05", ambiente: "homologacion" });
+    expect(arca.pedidos.map(p => p.action.split("/").pop() || "login")).toEqual(["login", "FECompUltimoAutorizado", "FECAESolicitar"]);
+
+    // El acceso se reutiliza mientras no venza
+    await agent.put(`/api/empresas/${empresaId}/facturas/f2`).set(H).send({ cbte: 11, puntoVenta: 2, fecha: "2026-11-25", docTipo: "CF", concepto: "Productos", total: 10, estado: "pendiente" }).expect(200);
+    await agent.post(`/api/empresas/${empresaId}/facturas/f2/autorizar`).set(H).expect(200);
+    expect(arca.pedidos.filter(p => p.url.includes("LoginCms"))).toHaveLength(1);
+
+    // Ya autorizada: no se vuelve a pedir CAE
+    const otra = await agent.post(`/api/empresas/${empresaId}/facturas/f1/autorizar`).set(H).expect(422);
+    expect(otra.body.error).toMatch(/ya tiene CAE/);
+  });
+
+  it("explica qué falta antes de facturar", async () => {
+    const { agent, empresaId } = await cuenta(app, "nf@example.com");
+    await agent.put(`/api/empresas/${empresaId}/facturas/f1`).set(H).send({ cbte: 11, puntoVenta: 1, fecha: "2026-11-25", total: 10, estado: "pendiente" }).expect(200);
+    const r = await agent.post(`/api/empresas/${empresaId}/facturas/f1/autorizar`).set(H).expect(422);
+    expect(r.body.error).toMatch(/certificado de ARCA/);
+  });
+
+  it("protege las facturas autorizadas en producción", async () => {
+    const { agent, empresaId } = await cuenta(app, "prod@example.com");
+    await store.guardar(empresaId, "facturas", { id: "f9", estado: "autorizada", ambiente: "produccion", total: 5 });
+    await agent.delete(`/api/empresas/${empresaId}/facturas/f9`).set(H).expect(409);
+    await agent.put(`/api/empresas/${empresaId}/facturas/f9`).set(H).send({ total: 1 }).expect(409);
+  });
+
+  it("lee comprobantes con IA si está configurada", async () => {
+    const falso: any = { beta: { messages: { create: async (p: any) => {
+      expect(p.model).toBe("claude-opus-5-5");
+      expect(p.messages[0].content[0].type).toBe("document");
+      return { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify({ tipoComprobante: "Factura A", total: 1210, legible: true }) }] };
+    } } } };
+    const app2 = crearApp({ store, config, fetchFn: arca.fn, anthropic: falso });
+    const { agent, empresaId } = await cuenta(app2, "ocr@example.com");
+    const r = await agent.post(`/api/empresas/${empresaId}/ocr`).set(H).attach("archivo", Buffer.from("%PDF-1.4"), { filename: "f.pdf", contentType: "application/pdf" }).expect(200);
+    expect(r.body).toMatchObject({ tipoComprobante: "Factura A", total: 1210 });
+    await agent.post(`/api/empresas/${empresaId}/ocr`).set(H).attach("archivo", Buffer.from("hola"), { filename: "a.txt", contentType: "text/plain" }).expect(422);
+  });
+});
