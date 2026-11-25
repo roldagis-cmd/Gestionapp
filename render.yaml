@@ -1,0 +1,26 @@
+# Blueprint de Render: servicio web gratuito. La base de datos va aparte (por ejemplo Neon gratis) en DATABASE_URL.
+services:
+  - type: web
+    name: gestionapp
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: MASTER_KEY
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
